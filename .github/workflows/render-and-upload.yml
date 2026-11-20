@@ -1,0 +1,72 @@
+name: Render 2D Documentary & Upload to R2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'videos/**'
+  workflow_dispatch:
+    inputs:
+      video_slug:
+        description: 'Folder name inside videos/ to render (e.g. gta6-firetv-hack)'
+        required: true
+        default: 'gta6-firetv-hack'
+
+env:
+  R2_BUCKET: gemini-media-vault
+  R2_PUBLIC_BASE: https://pub-e6c09b30e18c436c9dd94c55aa2aedd5.r2.dev
+
+jobs:
+  render-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js (for Wrangler R2 upload)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install system dependencies (Cairo, FFmpeg, Fonts)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev pkg-config python3-dev ffmpeg fonts-noto-core fonts-dejavu-core
+          pip install pycairo numpy
+
+      - name: Detect target video folder(s)
+        id: detect
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SLUGS="${{ github.event.inputs.video_slug }}"
+          else
+            SLUGS=$(git diff --name-only HEAD~1 HEAD -- videos/ | awk -F/ 'NF>=2 {print $2}' | sort -u | tr '\n' ' ')
+            if [ -z "$SLUGS" ]; then
+              SLUGS="gta6-firetv-hack"
+            fi
+          fi
+          echo "slugs=$SLUGS" >> "$GITHUB_OUTPUT"
+
+      - name: Render video(s) and upload to Cloudflare R2
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          for SLUG in ${{ steps.detect.outputs.slugs }}; do
+            DIR="videos/$SLUG"
+            [ -f "$DIR/render.py" ] || continue
+            (cd "$DIR" && python3 render.py)
+            npx --yes wrangler r2 object put "$R2_BUCKET/$SLUG.mp4" \
+              --file="$DIR/output.mp4" \
+              --content-type="video/mp4" \
+              --remote
+            echo "### Uploaded: \`$SLUG.mp4\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **Live R2 URL:** $R2_PUBLIC_BASE/$SLUG.mp4" >> "$GITHUB_STEP_SUMMARY"
+          done
